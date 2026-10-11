@@ -16,7 +16,10 @@ __version__ = "1.0.0"
 
 
 def register(ctx):  # noqa: ANN001 - plugin context is duck-typed by Hermes
-    from . import provider
+    try:
+        from . import provider  # package-qualified load (Hermes directory plugin)
+    except ImportError:
+        import provider  # direct/script load fallback
 
     provider.register_tools(ctx)
     provider.register_gate(ctx)
