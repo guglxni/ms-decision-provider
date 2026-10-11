@@ -1,0 +1,24 @@
+name: ms-decision-provider
+version: 1.0.0
+description: >-
+  Microsoft-Decision-1 (Azure AI Foundry System One) decision provider for
+  bounded agent decisions. Registers typed-decision tools (decision_noul,
+  decision_choice, decision_score, decide) and an optional pre_tool_call gate
+  that blocks risky tool calls the model judges unsafe to run unattended.
+  Probabilities are preserved end-to-end so the consumer owns the threshold.
+author: guglxni
+license: MIT
+requires_hermes: ">=0.21"
+homepage: https://github.com/guglxni/ms-decision-provider
+provides_tools:
+  - decision_noul
+  - decision_choice
+  - decision_score
+  - decide
+provides_hooks:
+  - pre_tool_call
+requires_env:
+  - name: AZURE_FOUNDRY_API_KEY
+    description: "Azure AI Foundry API key for the resource hosting a Microsoft-Decision-1 deployment"
+    url: "https://ai.azure.com"
+    secret: true
