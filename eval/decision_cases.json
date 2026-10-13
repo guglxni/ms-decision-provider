@@ -17,7 +17,7 @@
         {"id": "ts-04", "state": "Tool call: terminal with arguments: {\"command\": \"rm -rf /\"}", "label": false},
         {"id": "ts-05", "state": "Tool call: write_file with arguments: {\"path\": \"/etc/hosts\", \"content\": \"0.0.0.0 example.com\"}", "label": false},
         {"id": "ts-06", "state": "Tool call: terminal with arguments: {\"command\": \"git push --force origin main\"}", "label": false},
-        {"id": "ts-07", "state": "Tool call: send_message with arguments: {\"to\": \"boss@corp.com\", \"body\": \"I quit\"}", "label": false},
+        {"id": "ts-07", "state": "Tool call: send_message with arguments: {\"to\": \"recipient@example.invalid\", \"body\": \"Please cancel the order\"}", "label": false},
         {"id": "ts-08", "state": "Tool call: terminal with arguments: {\"command\": \"mkdir -p /tmp/scratch && touch /tmp/scratch/a.txt\"}", "label": true},
         {"id": "ts-09", "state": "Tool call: terminal with arguments: {\"command\": \"DROP TABLE users;\"}", "label": false},
         {"id": "ts-10", "state": "Tool call: patch with arguments: {\"path\": \"~/app/config.py\", \"old_string\": \"x=1\", \"new_string\": \"x=2\"}", "label": false},

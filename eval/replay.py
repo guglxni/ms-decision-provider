@@ -18,62 +18,34 @@ Usage:
     python3 eval/replay.py --coverage 0.7           # abstain below p=0.7
     python3 eval/replay.py --cases my_cases.json    # custom corpus
 
-Requires AZURE_FOUNDRY_API_KEY (resolved via Hermes's secret scope, or env).
-Fails closed with a clear message if the provider is unreachable — a replay
-harness must not silently fabricate results.
+Requires AZURE_FOUNDRY_API_KEY and AZURE_FOUNDRY_BASE_URL, resolved at call
+time via Hermes's profile-aware secret scope (env works in a single-profile
+process). Fails closed with a clear message if the provider is unreachable.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
+from pathlib import Path
+
+# Use the same endpoint validation, no-redirect transport, and secret scope as
+# the installed plugin. A standalone replay must supply Hermes on PYTHONPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import provider
 
 _MODEL = os.environ.get("MS_DECISION_MODEL", "ms-decision-1")
 _TIMEOUT = float(os.environ.get("MS_DECISION_TIMEOUT", "60"))
 
 
-def _get_secret(name: str) -> str:
-    """Resolve via Hermes's public secret scope, env fallback, never .env."""
-    try:
-        from agent.secret_scope import get_secret  # type: ignore
-
-        val = get_secret(name)
-        if val:
-            return val
-    except Exception:
-        pass
-    return os.environ.get(name, "")
-
-
-def _base_url() -> str:
-    b = _get_secret("AZURE_FOUNDRY_BASE_URL").rstrip("/")
-    if not b:
-        raise RuntimeError("set AZURE_FOUNDRY_BASE_URL to your own Foundry resource")
-    for suffix in ("/openai/v1", "/openai", "/v1"):
-        if b.endswith(suffix):
-            b = b[: -len(suffix)]
-            break
-    return b
-
-
 def _call(state: str, questions: dict) -> dict:
-    """One System One call. Raises on any failure (replay must not fabricate)."""
-    body = json.dumps({"model": _MODEL, "state": state, "questions": questions}).encode()
-    key = _get_secret("AZURE_FOUNDRY_API_KEY")
-    if not key:
-        raise RuntimeError("AZURE_FOUNDRY_API_KEY not set (set it in your secret scope or environment)")
-    req = urllib.request.Request(
-        f"{_base_url()}/providers/microsoft/v1/systemone",
-        data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}", "api-key": key},
-    )
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
-        return json.loads(r.read().decode())
+    """Reuse the plugin transport; fail loudly rather than inventing metrics."""
+    response = provider._call(state, questions, model=_MODEL, timeout=_TIMEOUT)
+    if "error" in response:
+        raise RuntimeError(f"decision provider failed: {response['error']}")
+    return response
 
 
 # ── scoring helpers ───────────────────────────────────────────────────────────
@@ -127,9 +99,8 @@ def replay_family(family: dict, coverage: float, delay: float) -> dict:
         metrics["accuracy"] = round(correct / len(rows), 3)
         metrics["brier"] = round(sum(_brier(p, lab) for p, lab in rows) / len(rows), 4)
         metrics["calibration"] = _bucket_calibration(rows)
-        # risk-vs-coverage: of cases where the model is confident enough to act
-        # (dist from 0.5 >= coverage margin), what fraction are correct?
-        confident = [(p, lab) for p, lab in rows if abs(p - 0.5) >= (coverage - 0.5) * 2 or abs(p - 0.5) >= (1 - coverage)]
+        # risk-vs-coverage: accuracy on cases whose predicted label has
+        # probability at least the family-specific decision threshold.
         confident = [(p, lab) for p, lab in rows if max(p, 1 - p) >= coverage]
         if confident:
             cc = sum(1 for p, lab in confident if (p >= 0.5) == lab)
@@ -188,12 +159,20 @@ def main() -> int:
             print(f"no family named {args.family!r}", file=sys.stderr)
             return 2
 
-    print(f"# ms-decision replay — model={_MODEL} base={_base_url()}\n")
+    try:
+        base = provider._base_url()
+    except Exception:
+        print("credential scope unavailable for AZURE_FOUNDRY_BASE_URL", file=sys.stderr)
+        return 2
+    if not base:
+        print("AZURE_FOUNDRY_BASE_URL is not set to a valid Azure OpenAI resource", file=sys.stderr)
+        return 2
+    print(f"# ms-decision replay — model={_MODEL} (endpoint configured)\n")
     report = {}
     for fam in families:
         print(f"▸ {fam['name']} ({fam['question_type']}, {len(fam['cases'])} cases)…", flush=True)
         report[fam["name"]] = replay_family(fam, args.coverage, args.delay)
-        print(f"  done\n")
+        print("  done\n")
 
     print(json.dumps(report, indent=2))
     return 0

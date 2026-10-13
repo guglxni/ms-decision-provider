@@ -20,7 +20,7 @@ A decision-native backend is different: the output domain is declared up front, 
 
 ## What it adds
 
-### Tools (registered when `AZURE_FOUNDRY_API_KEY` is present)
+### Tools (registered when both `AZURE_FOUNDRY_API_KEY` and `AZURE_FOUNDRY_BASE_URL` resolve in the active Hermes secret scope)
 
 - **`decision_noul`** — `state`, `question`, optional `true_label`/`false_label` → yes/no probability.
 - **`decision_choice`** — `state`, `question`, `options[]`, optional `criteria{option:desc}` → chosen option + probabilities + confidence.
@@ -29,18 +29,15 @@ A decision-native backend is different: the output domain is declared up front, 
 
 ### Optional safety gate (`pre_tool_call` hook)
 
-When `MS_DECISION_GATE=1`, a `pre_tool_call` hook classifies risky tool calls (`terminal`, `write_file`, `patch`, `process_manage`, browser actions, `cronjob_manage`, `delegate_task`, `send_message`, `skill_manage`) and **blocks** any the model judges unsafe to run unattended (safety probability below `MS_DECISION_BLOCK_THRESHOLD`, default `0.5`). Reads and the decision tools themselves pass through unclassified. The gate **fails open** on any provider error so a down/rate-limited endpoint never wedges the agent loop.
+When `MS_DECISION_GATE=1`, a `pre_tool_call` hook sends **only a fixed tool name and coarse, allowlisted operation label** to Azure; raw arguments, file paths, messages, URLs, and other private contents stay local. For known-risk tools (`terminal`, `execute_code`, `write_file`, `patch`, `process_manage`, browser actions, `cronjob_manage`, `delegate_task`, `send_message`, `skill_manage`) **and unrecognized `mcp__*` calls**, the remote score is **advisory**. The hook requests Hermes's human approval for every such call (including missing/malformed provider responses); it does not auto-authorize based on a model score. The local human prompt shows the complete action arguments with Hermes's secret redactor forced on, while Azure receives only the coarse projection. In `MS_DECISION_GATE_MODE=block`, it hard-blocks when the score is below `MS_DECISION_BLOCK_THRESHOLD` (default `0.5`) or unavailable. Decision tools are excluded to avoid recursion; other tools follow Hermes's existing guardrails. This is **not** a universal security boundary or a replacement for Hermes's permissions.
 
-```json
-{"action": "block",
- "message": "[ms-decision-gate] Microsoft-Decision-1 judged this terminal call unsafe to auto-run (safety p=0.00 < 0.5). Needs explicit user approval."}
-```
+`approve` uses Hermes's approval path, including its configured session/permanent allowlist, cron and single-query policies, and explicit yolo bypasses. An approval rule key is scoped to the full call via a per-process HMAC, rather than the tool name alone; a process restart invalidates previously cached rules. Users who require hard denial should select `MS_DECISION_GATE_MODE=block` and review Hermes's own approval settings. For this plugin, only the four typed decision tools explicitly send caller-supplied `state`/`questions` text to Azure. Do not put secrets or PII in those inputs unless the destination is authorized for them.
 
 ### Shadow replay harness (`eval/`)
 
 `eval/replay.py` replays a labeled decision corpus through the provider **without changing Hermes behavior** and scores each family independently — the RFC's shadow-mode / evaluation acceptance criterion. See [`eval/README.md`](eval/README.md).
 
-**Measured on the shipped 32-case corpus** (GlobalStandard, capacity 100):
+**Historical baseline** (32-case corpus before the `ts-07` wording was sanitized; GlobalStandard, capacity 100). These numbers are **not** a fresh measurement of the revised corpus or the privacy-projected gate. In particular, the gate intentionally maps both destructive and benign `rm` calls to the same remote state and requires human approval either way; these accuracy figures cannot be interpreted as gate effectiveness. Re-run a projected-state evaluation on your own deployment before selecting thresholds:
 
 | Family | Type | Metric | Result |
 |--------|------|--------|--------|
@@ -84,22 +81,23 @@ Once catalog-listed: `hermes plugins install ms-decision-provider`.
 | `AZURE_FOUNDRY_BASE_URL` | — (required) | Your Foundry resource base URL (`/openai/v1` suffix stripped — System One hangs off the host root). No default; unset = nothing is sent. |
 | `MS_DECISION_MODEL` | `ms-decision-1` | Deployment name |
 | `MS_DECISION_GATE` | `0` (off) | Set `1` to enable the `pre_tool_call` gate |
-| `MS_DECISION_BLOCK_THRESHOLD` | `0.5` | Safety probability below which the gate blocks |
+| `MS_DECISION_BLOCK_THRESHOLD` | `0.5` | Safety probability below which **block mode** hard-denies; all known-risk calls otherwise require approval |
+| `MS_DECISION_GATE_MODE` | `approve` | `approve` asks a human; `block` hard-denies low-score/missing signals, asks for approval otherwise |
 | `MS_DECISION_TIMEOUT` | `20` | Gate call timeout (s) |
 
 ## Design notes (aligned with RFC #113008)
 
 - **Probabilities are first-class** — full distributions returned, never collapsed to a label by the provider.
 - **Consumer owns policy** — thresholds and abstention live at the call site, not in a global constant.
-- **Explicit state projection** — the provider receives only the `state` string the caller supplies; it does not inherit session history, memory, system prompts, or credentials.
-- **Abstention is normal** — low-confidence or provider-unavailable is distinguishable from "decision made" and defaults to existing behavior (fail open).
+- **Explicit state projection** — typed decision tools transmit only `state`/`questions` supplied by the caller, and the gate transmits only coarse allowlisted operation labels; no session history, memory, prompts, raw tool arguments, or credentials in request bodies.
+- **Abstention is normal** — low confidence or provider unavailability produces an error for tools and never auto-authorizes a known-risk tool call; the host's approval policy decides the result.
 - **Shadow evaluation is first-class** — `eval/replay.py` scores each decision family (accuracy, Brier, calibration, risk-vs-coverage) without touching runtime behavior.
 - **No prompt-cache impact** — registration adds no model-visible system-prompt text; tools are ordinary registry entries.
 - **No TypeSafe/Jev dependency** — provider-neutral in spirit; this is one backend (Microsoft-Decision-1 on Azure), comparable against others via the replay harness.
 
 ## Failure semantics
 
-Provider disabled / missing credential / timeout / malformed response → **existing Hermes behavior** (the gate allows, tools return `{"error": ...}`). Fail-closed is the caller's explicit choice at its own enforcement boundary, not a silent default.
+Missing/invalid endpoint or credential → no request; the tool returns a sanitized `{"error": ...}`. HTTP failures and redirects are sanitized too. The optional gate does not auto-allow known-risk calls on transport errors, malformed responses, or low confidence: it asks Hermes's approval gate (or hard-blocks in `block` mode). Hermes's explicit yolo, cron/single-query approval policy, and user allowlists still apply. This plugin is advisory, not a comprehensive security sandbox.
 
 ## License
 

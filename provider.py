@@ -18,11 +18,17 @@ secret route (``agent.secret_scope.get_secret``) — this plugin never opens
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
+import shlex
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 _MODEL_ENV = "MS_DECISION_MODEL"
 _DEFAULT_MODEL = "ms-decision-1"
@@ -31,40 +37,40 @@ _DEFAULT_MODEL = "ms-decision-1"
 # Hermes's human approval prompt (matches the "needs explicit approval" text).
 _GATE_MODE = os.environ.get("MS_DECISION_GATE_MODE", "approve")
 
-# Tools the pre_tool_call gate considers risky enough to classify. Reads and
-# the decision tools themselves always pass through unclassified.
+# Opt-in advisory gate: narrow set of known tools. Tools not listed here
+# follow Hermes's native guardrails; this plugin is not a universal sandbox.
 RISKY_TOOLS = frozenset({
     "terminal", "execute_code", "write_file", "patch", "process_manage",
-    "browser_navigate", "browser_click", "browser_type", "cronjob_manage",
-    "delegate_task", "send_message", "skill_manage",
+    "browser_navigate", "browser_click", "browser_type", "browser_exec",
+    "computer_use", "cronjob_manage", "delegate_task", "send_message",
+    "skill_manage",
 })
-SAFE_TOOLS = frozenset({
-    "read_file", "search_files", "web_search", "web_extract", "session_search",
-    "skill_view", "skills_list", "todo_list", "memory", "vision_analyze",
-    "text_to_speech", "decide", "decision_noul", "decision_choice", "decision_score",
+# Decision tools expose an explicit state string to Azure by design; do not
+# apply the safety gate to their own calls (would recurse).
+DECISION_TOOLS = frozenset({
+    "decide", "decision_noul", "decision_choice", "decision_score",
+    "mcp__ms_decision__decide", "mcp__ms_decision__decision_noul",
+    "mcp__ms_decision__decision_choice", "mcp__ms_decision__decision_score",
 })
 
 # Gate policy knobs (env-overridable). The consumer owns the threshold.
 _BLOCK_THRESHOLD = float(os.environ.get("MS_DECISION_BLOCK_THRESHOLD", "0.5"))
 _TIMEOUT = float(os.environ.get("MS_DECISION_TIMEOUT", "20"))
 _GATE_ENABLED = os.environ.get("MS_DECISION_GATE", "0") in ("1", "true", "yes")
+# A random per-process HMAC key prevents persistent approval rule keys from
+# becoming a deterministic hash oracle for private tool arguments.
+_RULE_KEY_SECRET = secrets.token_bytes(32)
 
 
 def _get_secret(name: str) -> str:
-    """Resolve a credential via Hermes's public secret scope (profile-aware).
+    """Resolve at call time using Hermes's profile-aware credential scope.
 
-    Falls back to the process environment when the agent secret_scope module is
-    unavailable (e.g. running the eval harness standalone outside the runtime).
+    A missing or unscoped value must never fall back to another profile's
+    process environment. In particular, do not catch UnscopedSecretError.
     """
-    try:
-        from agent.secret_scope import get_secret  # type: ignore
+    from agent.secret_scope import get_secret
 
-        val = get_secret(name)
-        if val:
-            return val
-    except Exception:
-        pass
-    return os.environ.get(name, "")
+    return get_secret(name) or ""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -78,16 +84,28 @@ _opener = urllib.request.build_opener(_NoRedirect)
 
 
 def _base_url() -> str:
-    """System One hangs off the resource host root, NOT the .../openai/v1 suffix
-    that AZURE_FOUNDRY_BASE_URL often carries for chat/responses."""
-    b = _get_secret("AZURE_FOUNDRY_BASE_URL").rstrip("/")
-    if not b:
+    """Accept only explicit HTTPS Azure OpenAI resource hosts.
+
+    System One hangs off the host root, not the chat API's /openai/v1.
+    Reject arbitrary domains, userinfo, ports, query strings, and extra paths
+    so a misconfigured endpoint cannot receive a credential or state text.
+    """
+    raw = _get_secret("AZURE_FOUNDRY_BASE_URL").strip()
+    if not raw:
         return ""
-    for suffix in ("/openai/v1", "/openai", "/v1"):
-        if b.endswith(suffix):
-            b = b[: -len(suffix)]
-            break
-    return b
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        host = (parsed.hostname or "").lower()
+        if (parsed.scheme != "https" or not host.endswith(".openai.azure.com")
+                or not re.fullmatch(r"[a-z0-9-]+\.openai\.azure\.com", host)
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port is not None
+                or parsed.query or parsed.fragment
+                or parsed.path.rstrip("/") not in ("", "/openai", "/openai/v1")):
+            return ""
+        return f"https://{host}"
+    except ValueError:
+        return ""
 
 
 def _model() -> str:
@@ -97,33 +115,36 @@ def _model() -> str:
 def _call(state: str, questions: Dict[str, Dict[str, Any]], model: Optional[str] = None, timeout: float = 60.0) -> Dict[str, Any]:
     """POST to the System One endpoint and return the parsed response.
 
-    Fails closed (and sends nothing) when the endpoint is unconfigured, and
-    returns {"error": ...} on any transport/HTTP error so callers can fail open
-    without an exception escaping into the agent loop.
+    Sends nothing when the endpoint/key are missing or unscoped. Transport and
+    HTTP errors return sanitized {"error": ...} without body or URL text.
     """
-    base = _base_url()
+    try:
+        base = _base_url()
+        key = _get_secret("AZURE_FOUNDRY_API_KEY") if base else ""
+    except Exception:
+        # UnscopedSecretError in a multiplexed gateway is fail-closed:
+        # never read the process environment as a substitute.
+        return {"error": "credential scope unavailable"}
     if not base:
         return {"error": "set AZURE_FOUNDRY_BASE_URL"}
-    key = _get_secret("AZURE_FOUNDRY_API_KEY")
     if not key:
         return {"error": "missing AZURE_FOUNDRY_API_KEY"}
     body = json.dumps({"model": model or _model(), "state": state, "questions": questions}).encode()
+    # Azure System One accepts the Foundry API key via api-key. Do not send
+    # duplicate credential-bearing headers when one is sufficient.
     req = urllib.request.Request(
         f"{base}/providers/microsoft/v1/systemone",
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
-            "api-key": key,
-        },
+        headers={"Content-Type": "application/json", "api-key": key},
     )
     try:
         with _opener.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:  # pragma: no cover - network
-        return {"error": f"HTTP {e.code}", "detail": e.read().decode()[:400]}
+        e.close()
+        return {"error": f"HTTP {e.code}"}  # Never surface an echoed state/key.
     except Exception as e:  # pragma: no cover - network
-        return {"error": type(e).__name__, "detail": str(e)[:300]}
+        return {"error": type(e).__name__}  # Exception text may contain URL/PII.
 
 
 # ── Tool handlers (each returns a JSON string) ────────────────────────────────
@@ -164,8 +185,11 @@ def _decide_handler(args: Mapping[str, Any], **_: Any) -> str:
 
 
 def check_requirements() -> bool:
-    """Tools surface only when both the key and the endpoint are configured."""
-    return bool(_get_secret("AZURE_FOUNDRY_API_KEY")) and bool(_base_url())
+    """Tools surface only when both the key and endpoint are scoped/configured."""
+    try:
+        return bool(_get_secret("AZURE_FOUNDRY_API_KEY")) and bool(_base_url())
+    except Exception:
+        return False
 
 
 def register_tools(ctx) -> None:  # noqa: ANN001
@@ -242,22 +266,79 @@ def register_tools(ctx) -> None:  # noqa: ANN001
 
 # ── pre_tool_call gate ────────────────────────────────────────────────────────
 
-def _gate(tool_name: str, args: Mapping[str, Any], **_: Any) -> Optional[Dict[str, Any]]:
-    """Escalate the call for human approval when the model judges it unsafe.
+def _project_operation(tool_name: str, args: Mapping[str, Any]) -> str:
+    """Transmit only tool/operation identifiers, never arguments, paths or PII.
 
-    Returns an "approve" directive (hand to Hermes's human approval prompt) or a
-    hard "block" depending on MS_DECISION_GATE_MODE; None (allow) otherwise.
-    Fails open on any provider error so a down endpoint never wedges the loop.
+    This is intentionally coarse: a classifier cannot safely inspect arbitrary
+    tool contents without an explicit data-egress contract. For ambiguous calls
+    we require human approval locally instead of transmitting private content.
+    """
+    operation = ""
+    if tool_name == "terminal":
+        try:
+            words = shlex.split(str(args.get("command", "")))
+            allowed = {"rm", "git", "ls", "mkdir", "curl", "python", "python3",
+                       "brew", "npm", "pip", "mv", "cp", "cat", "chmod", "sudo"}
+            if words and words[0] in allowed:
+                operation = words[0]
+                if words[0] == "git" and len(words) > 1 and words[1] in {
+                    "push", "reset", "clean", "status", "diff", "log", "checkout", "commit"
+                }:
+                    operation += " " + words[1]
+        except (TypeError, ValueError):
+            pass
+    elif tool_name in {"cronjob_manage", "process_manage"}:
+        candidate = args.get("action", "")
+        if isinstance(candidate, str) and candidate in {
+            "create", "update", "remove", "pause", "resume", "run", "kill", "poll", "list"
+        }:
+            operation = candidate
+    # MCP/browser tool names can come from third-party integrations. Reduce
+    # them to a fixed category so even a malicious name cannot enter egress.
+    if tool_name.startswith("mcp__"):
+        label = "mcp_tool"
+    elif tool_name.startswith("browser_"):
+        label = "browser_tool"
+    else:
+        label = tool_name if tool_name in RISKY_TOOLS else "other_tool"
+    return f"Tool call: {label}; operation: {operation or 'unspecified'}"
+
+
+def _local_approval_summary(tool_name: str, args: Mapping[str, Any]) -> str:
+    """Show the complete proposed call to the human, never the remote model.
+
+    Hermes's secret redactor is forced on for this boundary even when global
+    output redaction is disabled. The user must see the *whole* action; a
+    truncated command could hide a destructive suffix. This description is
+    consumed by the local approval UI, not included in the Azure request.
+    """
+    from agent.redact import redact_sensitive_text
+
+    raw = json.dumps(args, ensure_ascii=True, sort_keys=True)
+    safe = redact_sensitive_text(raw, force=True, redact_url_credentials=True)
+    return f"{tool_name} arguments:\n{safe}"
+
+
+def _gate(tool_name: str, args: Mapping[str, Any], **_: Any) -> Optional[Dict[str, Any]]:
+    """Escalate known-risk operations to Hermes's human approval gate.
+
+    Only allowlisted operation names, never raw arguments, are sent to Azure.
+    The score is advisory; errors and malformed responses do not imply allow.
+    Human approval is host-enforced and subject to Hermes's own bypass modes.
     """
     if not _GATE_ENABLED:
         return None
-    if tool_name in SAFE_TOOLS:
+    if tool_name in DECISION_TOOLS:
         return None
     if tool_name not in RISKY_TOOLS and not tool_name.startswith(("mcp__", "browser_")):
         return None
+    if not isinstance(args, Mapping):
+        args = {}
 
-    summary = json.dumps(args)[:600]
-    state = f"Tool call: {tool_name} with arguments: {summary}"
+    try:
+        state = _project_operation(tool_name, args)
+    except (TypeError, ValueError):
+        state = "Tool call: other_tool; operation: unspecified"
     resp = _call(state, {"safe": {
         "type": "noul",
         "instructions": "Is this operation safe to run automatically without user approval?",
@@ -269,21 +350,49 @@ def _gate(tool_name: str, args: Mapping[str, Any], **_: Any) -> Optional[Dict[st
 
     try:
         p_safe = resp["answers"]["safe"]["noul"]
-    except Exception:
-        return None  # fail open
-    if p_safe < _BLOCK_THRESHOLD:
+        if not isinstance(p_safe, (int, float)) or isinstance(p_safe, bool) or not 0 <= p_safe <= 1:
+            raise ValueError("invalid probability")
+    except (TypeError, KeyError, ValueError):
+        p_safe = None  # unavailable / malformed is ambiguous, not permission to bypass
+
+    if _GATE_MODE not in ("approve", "block"):
+        return {"action": "block", "message": "[ms-decision-gate] invalid gate mode"}
+    # The classifier sees no raw arguments, so it cannot prove an operation
+    # safe. Every tool in the explicit risk set requires human approval;
+    # the remote score is advisory and may additionally hard-block in block mode.
+    if p_safe is None or p_safe < _BLOCK_THRESHOLD:
         message = (
-            f"[ms-decision-gate] Microsoft-Decision-1 judged this {tool_name} call unsafe to "
-            f"auto-run (safety p={p_safe:.2f} < {_BLOCK_THRESHOLD}). Needs explicit user approval."
+            f"[ms-decision-gate] {tool_name}: decision unavailable or below "
+            "the configured safety threshold; human approval required."
         )
-        if _GATE_MODE == "block":
-            return {"action": "block", "message": message}
-        # Default: hand to Hermes's human approval prompt rather than hard-block.
-        return {"action": "approve", "message": message}
-    return None
+    else:
+        message = (
+            f"[ms-decision-gate] {tool_name}: model signal is advisory "
+            "(arguments stayed local); human approval required."
+        )
+    # The full proposed action is shown only to the local human approval UI.
+    # Never place it in the Azure state or a persistent allowlist key.
+    try:
+        message += "\n" + _local_approval_summary(tool_name, args)
+    except Exception:
+        return {"action": "block", "message": "[ms-decision-gate] cannot display proposed action for approval"}
+    if _GATE_MODE == "block" and (p_safe is None or p_safe < _BLOCK_THRESHOLD):
+        return {"action": "block", "message": message}
+    # Approval caches must be specific to the full call, not just the tool
+    # name; an HMAC prevents the on-disk key from revealing simple arguments.
+    try:
+        serialized_args = json.dumps([tool_name, args], sort_keys=True, default=str).encode()
+    except (TypeError, ValueError, RecursionError):
+        # No stable per-call identity -> do not permit an approval cache hit.
+        return {"action": "block", "message": "[ms-decision-gate] cannot fingerprint tool arguments"}
+    rule_key = "ms-decision:" + hmac.new(
+        _RULE_KEY_SECRET, serialized_args, hashlib.sha256,
+    ).hexdigest()
+    return {"action": "approve", "message": message, "rule_key": rule_key}
 
 
 def register_gate(ctx) -> None:  # noqa: ANN001
-    ctx.register_hook("pre_tool_call", lambda **kwargs: _gate(
-        kwargs.get("tool_name", ""), kwargs.get("args") or kwargs.get("tool_input") or {}, **kwargs
-    ))
+    def gate_hook(**kwargs):
+        return _gate(kwargs.get("tool_name", ""), kwargs.get("args") or {})
+
+    ctx.register_hook("pre_tool_call", gate_hook)

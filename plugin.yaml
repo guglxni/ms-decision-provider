@@ -4,7 +4,7 @@ description: >-
   Microsoft-Decision-1 (Azure AI Foundry System One) decision provider for
   bounded agent decisions. Registers typed-decision tools (decision_noul,
   decision_choice, decision_score, decide) and an optional pre_tool_call gate
-  that blocks risky tool calls the model judges unsafe to run unattended.
+  that optionally asks for human approval before known-risk tool calls.
   Probabilities are preserved end-to-end so the consumer owns the threshold.
 author: guglxni
 license: MIT
