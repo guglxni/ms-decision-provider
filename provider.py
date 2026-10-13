@@ -10,6 +10,11 @@ Typed questions:
 
 Every handler returns a JSON string and preserves the full distribution so the
 caller can apply its own threshold / abstention policy.
+
+Credentials and the endpoint are resolved at call time through Hermes's public
+secret route (``agent.secret_scope.get_secret``) — this plugin never opens
+``~/.hermes/.env`` itself and never sends anything anywhere unless
+``AZURE_FOUNDRY_BASE_URL`` is explicitly set.
 """
 from __future__ import annotations
 
@@ -19,9 +24,12 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Mapping, Optional
 
-_DEFAULT_BASE = "https://guglaniaaryan-4736-resource.openai.azure.com"
 _MODEL_ENV = "MS_DECISION_MODEL"
 _DEFAULT_MODEL = "ms-decision-1"
+
+# How the gate escalates: "block" hard-denies the call; "approve" hands it to
+# Hermes's human approval prompt (matches the "needs explicit approval" text).
+_GATE_MODE = os.environ.get("MS_DECISION_GATE_MODE", "approve")
 
 # Tools the pre_tool_call gate considers risky enough to classify. Reads and
 # the decision tools themselves always pass through unclassified.
@@ -42,26 +50,39 @@ _TIMEOUT = float(os.environ.get("MS_DECISION_TIMEOUT", "20"))
 _GATE_ENABLED = os.environ.get("MS_DECISION_GATE", "0") in ("1", "true", "yes")
 
 
-def _env_file_key(key: str) -> str:
-    """Read a credential from the OS env, falling back to ~/.hermes/.env."""
-    val = os.environ.get(key)
-    if val:
-        return val
-    env_path = os.path.expanduser("~/.hermes/.env")
+def _get_secret(name: str) -> str:
+    """Resolve a credential via Hermes's public secret scope (profile-aware).
+
+    Falls back to the process environment when the agent secret_scope module is
+    unavailable (e.g. running the eval harness standalone outside the runtime).
+    """
     try:
-        with open(env_path) as fh:
-            for line in fh:
-                if line.startswith(key + "="):
-                    return line.strip().split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
+        from agent.secret_scope import get_secret  # type: ignore
+
+        val = get_secret(name)
+        if val:
+            return val
+    except Exception:
         pass
-    return ""
+    return os.environ.get(name, "")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so auth headers are never re-sent to a second host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
 
 
 def _base_url() -> str:
     """System One hangs off the resource host root, NOT the .../openai/v1 suffix
-    that AZURE_FOUNDRY_BASE_URL carries for chat/responses."""
-    b = (os.environ.get("AZURE_FOUNDRY_BASE_URL") or _env_file_key("AZURE_FOUNDRY_BASE_URL") or _DEFAULT_BASE).rstrip("/")
+    that AZURE_FOUNDRY_BASE_URL often carries for chat/responses."""
+    b = _get_secret("AZURE_FOUNDRY_BASE_URL").rstrip("/")
+    if not b:
+        return ""
     for suffix in ("/openai/v1", "/openai", "/v1"):
         if b.endswith(suffix):
             b = b[: -len(suffix)]
@@ -76,14 +97,19 @@ def _model() -> str:
 def _call(state: str, questions: Dict[str, Dict[str, Any]], model: Optional[str] = None, timeout: float = 60.0) -> Dict[str, Any]:
     """POST to the System One endpoint and return the parsed response.
 
-    On any transport/HTTP error returns {"error": ...} so callers fail open.
+    Fails closed (and sends nothing) when the endpoint is unconfigured, and
+    returns {"error": ...} on any transport/HTTP error so callers can fail open
+    without an exception escaping into the agent loop.
     """
-    body = json.dumps({"model": model or _model(), "state": state, "questions": questions}).encode()
-    key = _env_file_key("AZURE_FOUNDRY_API_KEY")
+    base = _base_url()
+    if not base:
+        return {"error": "set AZURE_FOUNDRY_BASE_URL"}
+    key = _get_secret("AZURE_FOUNDRY_API_KEY")
     if not key:
         return {"error": "missing AZURE_FOUNDRY_API_KEY"}
+    body = json.dumps({"model": model or _model(), "state": state, "questions": questions}).encode()
     req = urllib.request.Request(
-        f"{_base_url()}/providers/microsoft/v1/systemone",
+        f"{base}/providers/microsoft/v1/systemone",
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -92,7 +118,7 @@ def _call(state: str, questions: Dict[str, Dict[str, Any]], model: Optional[str]
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _opener.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:  # pragma: no cover - network
         return {"error": f"HTTP {e.code}", "detail": e.read().decode()[:400]}
@@ -138,11 +164,13 @@ def _decide_handler(args: Mapping[str, Any], **_: Any) -> str:
 
 
 def check_requirements() -> bool:
-    return bool(_env_file_key("AZURE_FOUNDRY_API_KEY"))
+    """Tools surface only when both the key and the endpoint are configured."""
+    return bool(_get_secret("AZURE_FOUNDRY_API_KEY")) and bool(_base_url())
 
 
 def register_tools(ctx) -> None:  # noqa: ANN001
-    common = dict(toolset="ms-decision", check_fn=check_requirements, requires_env=["AZURE_FOUNDRY_API_KEY"])
+    common = dict(toolset="ms-decision", check_fn=check_requirements,
+                  requires_env=["AZURE_FOUNDRY_API_KEY", "AZURE_FOUNDRY_BASE_URL"])
     str_prop = lambda d: {"type": "string", "description": d}  # noqa: E731
 
     ctx.register_tool(
@@ -215,10 +243,11 @@ def register_tools(ctx) -> None:  # noqa: ANN001
 # ── pre_tool_call gate ────────────────────────────────────────────────────────
 
 def _gate(tool_name: str, args: Mapping[str, Any], **_: Any) -> Optional[Dict[str, Any]]:
-    """Return a block directive when the model is confident the call is unsafe.
+    """Escalate the call for human approval when the model judges it unsafe.
 
-    Returns None (allow) otherwise. Fails open on any provider error so a
-    down/rate-limited decision endpoint never wedges the agent loop.
+    Returns an "approve" directive (hand to Hermes's human approval prompt) or a
+    hard "block" depending on MS_DECISION_GATE_MODE; None (allow) otherwise.
+    Fails open on any provider error so a down endpoint never wedges the loop.
     """
     if not _GATE_ENABLED:
         return None
@@ -243,13 +272,14 @@ def _gate(tool_name: str, args: Mapping[str, Any], **_: Any) -> Optional[Dict[st
     except Exception:
         return None  # fail open
     if p_safe < _BLOCK_THRESHOLD:
-        return {
-            "action": "block",
-            "message": (
-                f"[ms-decision-gate] Microsoft-Decision-1 judged this {tool_name} call unsafe to "
-                f"auto-run (safety p={p_safe:.2f} < {_BLOCK_THRESHOLD}). Needs explicit user approval."
-            ),
-        }
+        message = (
+            f"[ms-decision-gate] Microsoft-Decision-1 judged this {tool_name} call unsafe to "
+            f"auto-run (safety p={p_safe:.2f} < {_BLOCK_THRESHOLD}). Needs explicit user approval."
+        )
+        if _GATE_MODE == "block":
+            return {"action": "block", "message": message}
+        # Default: hand to Hermes's human approval prompt rather than hard-block.
+        return {"action": "approve", "message": message}
     return None
 
 

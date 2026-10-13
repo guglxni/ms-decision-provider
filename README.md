@@ -61,7 +61,7 @@ Latency p50 ≈ 1.0–1.2 s; ~40–110 input tokens, **1–3 output tokens** per
      --model-format Microsoft --sku-name GlobalStandard --sku-capacity 100
    ```
    Capacity 1 rate-limits almost immediately; use a comfortable capacity.
-2. `AZURE_FOUNDRY_API_KEY` (and `AZURE_FOUNDRY_BASE_URL`) in `~/.hermes/.env`.
+2. `AZURE_FOUNDRY_API_KEY` and `AZURE_FOUNDRY_BASE_URL` set (environment or your Hermes secret scope — resolved via `agent.secret_scope.get_secret`). Nothing is sent anywhere until both are set; unset endpoint → the plugin returns `{"error": "set AZURE_FOUNDRY_BASE_URL"}` and transmits nothing.
 
 > **OpenAI's `/v1/decisions` is a different, OpenAI-platform-only beta** and is **not** exposed on Azure AI Foundry (verified 404 across path shapes). `Microsoft-Decision-1` is the Foundry-native equivalent and what this plugin targets.
 
@@ -81,7 +81,7 @@ Once catalog-listed: `hermes plugins install ms-decision-provider`.
 | Env var | Default | Meaning |
 |---------|---------|---------|
 | `AZURE_FOUNDRY_API_KEY` | — (required) | Foundry API key |
-| `AZURE_FOUNDRY_BASE_URL` | `<your-foundry-resource>` | Resource base URL (`/openai/v1` suffix stripped — System One hangs off the host root) |
+| `AZURE_FOUNDRY_BASE_URL` | — (required) | Your Foundry resource base URL (`/openai/v1` suffix stripped — System One hangs off the host root). No default; unset = nothing is sent. |
 | `MS_DECISION_MODEL` | `ms-decision-1` | Deployment name |
 | `MS_DECISION_GATE` | `0` (off) | Set `1` to enable the `pre_tool_call` gate |
 | `MS_DECISION_BLOCK_THRESHOLD` | `0.5` | Safety probability below which the gate blocks |

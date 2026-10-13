@@ -18,9 +18,9 @@ Usage:
     python3 eval/replay.py --coverage 0.7           # abstain below p=0.7
     python3 eval/replay.py --cases my_cases.json    # custom corpus
 
-Requires AZURE_FOUNDRY_API_KEY (env or ~/.hermes/.env). Fails closed with a
-clear message if the provider is unreachable — a replay harness must not
-silently fabricate results.
+Requires AZURE_FOUNDRY_API_KEY (resolved via Hermes's secret scope, or env).
+Fails closed with a clear message if the provider is unreachable — a replay
+harness must not silently fabricate results.
 """
 from __future__ import annotations
 
@@ -33,27 +33,27 @@ import time
 import urllib.error
 import urllib.request
 
-_DEFAULT_BASE = "https://guglaniaaryan-4736-resource.openai.azure.com"
 _MODEL = os.environ.get("MS_DECISION_MODEL", "ms-decision-1")
 _TIMEOUT = float(os.environ.get("MS_DECISION_TIMEOUT", "60"))
 
 
-def _env_file_key(key: str) -> str:
-    val = os.environ.get(key)
-    if val:
-        return val
+def _get_secret(name: str) -> str:
+    """Resolve via Hermes's public secret scope, env fallback, never .env."""
     try:
-        with open(os.path.expanduser("~/.hermes/.env")) as fh:
-            for line in fh:
-                if line.startswith(key + "="):
-                    return line.strip().split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
+        from agent.secret_scope import get_secret  # type: ignore
+
+        val = get_secret(name)
+        if val:
+            return val
+    except Exception:
         pass
-    return ""
+    return os.environ.get(name, "")
 
 
 def _base_url() -> str:
-    b = (os.environ.get("AZURE_FOUNDRY_BASE_URL") or _env_file_key("AZURE_FOUNDRY_BASE_URL") or _DEFAULT_BASE).rstrip("/")
+    b = _get_secret("AZURE_FOUNDRY_BASE_URL").rstrip("/")
+    if not b:
+        raise RuntimeError("set AZURE_FOUNDRY_BASE_URL to your own Foundry resource")
     for suffix in ("/openai/v1", "/openai", "/v1"):
         if b.endswith(suffix):
             b = b[: -len(suffix)]
@@ -64,9 +64,9 @@ def _base_url() -> str:
 def _call(state: str, questions: dict) -> dict:
     """One System One call. Raises on any failure (replay must not fabricate)."""
     body = json.dumps({"model": _MODEL, "state": state, "questions": questions}).encode()
-    key = _env_file_key("AZURE_FOUNDRY_API_KEY")
+    key = _get_secret("AZURE_FOUNDRY_API_KEY")
     if not key:
-        raise RuntimeError("AZURE_FOUNDRY_API_KEY not set (env or ~/.hermes/.env)")
+        raise RuntimeError("AZURE_FOUNDRY_API_KEY not set (set it in your secret scope or environment)")
     req = urllib.request.Request(
         f"{_base_url()}/providers/microsoft/v1/systemone",
         data=body,

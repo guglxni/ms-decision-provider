@@ -22,3 +22,7 @@ requires_env:
     description: "Azure AI Foundry API key for the resource hosting a Microsoft-Decision-1 deployment"
     url: "https://ai.azure.com"
     secret: true
+  - name: AZURE_FOUNDRY_BASE_URL
+    description: "Your Foundry resource base URL, e.g. https://<resource>.openai.azure.com (or .../openai/v1). Never sent anywhere if unset."
+    url: "https://ai.azure.com"
+    secret: false
