@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -69,6 +70,12 @@ def _bucket_calibration(rows: list) -> dict:
 
 
 def replay_family(family: dict, coverage: float, delay: float) -> dict:
+    if not family.get("cases"):
+        raise ValueError("replay family must contain at least one case")
+    if not math.isfinite(coverage) or not 0.5 <= coverage <= 1:
+        raise ValueError("coverage must be a finite probability from 0.5 to 1")
+    if not math.isfinite(delay) or delay < 0:
+        raise ValueError("delay must be a finite nonnegative number")
     qtype = family["question_type"]
     results = []
     for case in family["cases"]:
@@ -150,9 +157,18 @@ def main() -> int:
     ap.add_argument("--coverage", type=float, default=0.7, help="confidence threshold for risk-vs-coverage (default 0.7)")
     ap.add_argument("--delay", type=float, default=0.3, help="seconds between calls (rate-limit friendly)")
     args = ap.parse_args()
+    if not math.isfinite(args.coverage) or not 0.5 <= args.coverage <= 1:
+        ap.error("--coverage must be between 0.5 and 1")
+    if not math.isfinite(args.delay) or args.delay < 0:
+        ap.error("--delay must be nonnegative and finite")
 
-    corpus = json.load(open(args.cases))
+    with open(args.cases, encoding="utf-8") as corpus_file:
+        corpus = json.load(corpus_file)
     families = corpus["families"]
+    if not families:
+        ap.error("corpus must contain at least one family")
+    if any(not family.get("cases") for family in families):
+        ap.error("every family must contain at least one case")
     if args.family:
         families = [f for f in families if f["name"] == args.family]
         if not families:

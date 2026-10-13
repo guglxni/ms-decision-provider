@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import provider  # noqa: E402
 from agent import secret_scope  # noqa: E402
+from eval import replay  # noqa: E402
 
 
 class SecurityTests(unittest.TestCase):
@@ -165,6 +166,26 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(states[0], states[1])
         self.assertEqual(provider._project_operation("mcp__send_private@example.invalid", {}),
                          "Tool call: mcp_tool; operation: unspecified")
+
+    def test_replay_rejects_empty_family_and_invalid_threshold_before_egress(self):
+        family = {"question_type": "noul", "cases": []}
+        with patch.object(replay, "_call") as send:
+            with self.assertRaisesRegex(ValueError, "at least one case"):
+                replay.replay_family(family, 0.7, 0)
+            family["cases"] = [{"id": "x", "state": "fixture", "label": True}]
+            for coverage in (-1, 0.2, 1.5, float("nan"), float("inf")):
+                with self.assertRaisesRegex(ValueError, "coverage"):
+                    replay.replay_family(family, coverage, 0)
+            send.assert_not_called()
+
+    def test_gate_hook_receives_host_payload_without_duplicate_kwargs(self):
+        hooks = {}
+        class Context:
+            def register_hook(self, event, callback): hooks[event] = callback
+        provider.register_gate(Context())
+        with patch.object(provider, "_GATE_ENABLED", True), patch.object(provider, "_call", return_value={"error": "offline"}):
+            result = hooks["pre_tool_call"](tool_name="write_file", args={"path": "scratch/a"}, task_id="synthetic")
+            self.assertEqual(result["action"], "approve")
 
     def test_request_uses_scoped_key_once_and_host_root(self):
         token = self.scoped({"AZURE_FOUNDRY_BASE_URL": "https://right.openai.azure.com/openai/v1", "AZURE_FOUNDRY_API_KEY": "SENTINEL"})
