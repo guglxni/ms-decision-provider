@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import provider  # noqa: E402
 from agent import secret_scope  # noqa: E402
-from eval import replay  # noqa: E402
+from tests.eval import replay  # noqa: E402
 
 
 class SecurityTests(unittest.TestCase):

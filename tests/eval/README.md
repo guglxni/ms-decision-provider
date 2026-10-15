@@ -1,4 +1,4 @@
-# eval/ — shadow replay harness
+# tests/eval/ — shadow replay harness
 
 A labeled-decision replay harness implementing the **shadow-mode / evaluation** acceptance criteria from [NousResearch/hermes-agent#113008](https://github.com/NousResearch/hermes-agent/issues/113008): *evaluate decision families, not models globally; abstention is first-class; thresholds are owned by the family; measure whether acting on the decision improves the outcome.*
 
@@ -7,9 +7,9 @@ It replays a labeled corpus through Microsoft-Decision-1 **without changing any 
 ## Run
 
 ```bash
-python3 eval/replay.py                    # all families
-python3 eval/replay.py --family tool_safety
-python3 eval/replay.py --coverage 0.8     # abstain below p=0.8
+python3 tests/eval/replay.py                    # all families
+python3 tests/eval/replay.py --family tool_safety
+python3 tests/eval/replay.py --coverage 0.8     # abstain below p=0.8
 ```
 
 Requires `AZURE_FOUNDRY_API_KEY` and `AZURE_FOUNDRY_BASE_URL` in the active Hermes secret scope (or environment in a single-profile process), plus Hermes's `agent.secret_scope` import on `PYTHONPATH`. The harness shares the plugin's URL validation, no-redirect transport, and sanitized errors. **Fails closed** on provider error — a replay harness must never fabricate metrics. Custom corpora may contain PII and are transmitted to your configured Azure resource: review them before replaying and do not publish response logs that contain private state.

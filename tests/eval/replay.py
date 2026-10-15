@@ -13,10 +13,10 @@ NousResearch/hermes-agent#113008: evaluate decision *families*, not models
 globally; abstention is first-class; thresholds are owned by the family.
 
 Usage:
-    python3 eval/replay.py                          # all families, real provider
-    python3 eval/replay.py --family tool_safety     # one family
-    python3 eval/replay.py --coverage 0.7           # abstain below p=0.7
-    python3 eval/replay.py --cases my_cases.json    # custom corpus
+    python3 tests/eval/replay.py                          # all families, real provider
+    python3 tests/eval/replay.py --family tool_safety     # one family
+    python3 tests/eval/replay.py --coverage 0.7           # abstain below p=0.7
+    python3 tests/eval/replay.py --cases my_cases.json    # custom corpus
 
 Requires AZURE_FOUNDRY_API_KEY and AZURE_FOUNDRY_BASE_URL, resolved at call
 time via Hermes's profile-aware secret scope (env works in a single-profile
@@ -34,7 +34,7 @@ from pathlib import Path
 
 # Use the same endpoint validation, no-redirect transport, and secret scope as
 # the installed plugin. A standalone replay must supply Hermes on PYTHONPATH.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import provider
 
 _MODEL = os.environ.get("MS_DECISION_MODEL", "ms-decision-1")

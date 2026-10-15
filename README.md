@@ -33,9 +33,9 @@ When `MS_DECISION_GATE=1`, a `pre_tool_call` hook sends **only a fixed tool name
 
 `approve` uses Hermes's approval path, including its configured session/permanent allowlist, cron and single-query policies, and explicit yolo bypasses. An approval rule key is scoped to the full call via a per-process HMAC, rather than the tool name alone; a process restart invalidates previously cached rules. Users who require hard denial should select `MS_DECISION_GATE_MODE=block` and review Hermes's own approval settings. For this plugin, only the four typed decision tools explicitly send caller-supplied `state`/`questions` text to Azure. Do not put secrets or PII in those inputs unless the destination is authorized for them.
 
-### Shadow replay harness (`eval/`)
+### Shadow replay harness (`tests/eval/`)
 
-`eval/replay.py` replays a labeled decision corpus through the provider **without changing Hermes behavior** and scores each family independently — the RFC's shadow-mode / evaluation acceptance criterion. See [`eval/README.md`](eval/README.md).
+`tests/eval/replay.py` replays a labeled decision corpus through the provider **without changing Hermes behavior** and scores each family independently — the RFC's shadow-mode / evaluation acceptance criterion. See [`tests/eval/README.md`](tests/eval/README.md).
 
 **Historical baseline** (32-case corpus before the `ts-07` wording was sanitized; GlobalStandard, capacity 100). These numbers are **not** a fresh measurement of the revised corpus or the privacy-projected gate. In particular, the gate intentionally maps both destructive and benign `rm` calls to the same remote state and requires human approval either way; these accuracy figures cannot be interpreted as gate effectiveness. Re-run a projected-state evaluation on your own deployment before selecting thresholds:
 
@@ -91,7 +91,7 @@ Once catalog-listed: `hermes plugins install ms-decision-provider`.
 - **Consumer owns policy** — thresholds and abstention live at the call site, not in a global constant.
 - **Explicit state projection** — typed decision tools transmit only `state`/`questions` supplied by the caller, and the gate transmits only coarse allowlisted operation labels; no session history, memory, prompts, raw tool arguments, or credentials in request bodies.
 - **Abstention is normal** — low confidence or provider unavailability produces an error for tools and never auto-authorizes a known-risk tool call; the host's approval policy decides the result.
-- **Shadow evaluation is first-class** — `eval/replay.py` scores each decision family (accuracy, Brier, calibration, risk-vs-coverage) without touching runtime behavior.
+- **Shadow evaluation is first-class** — `tests/eval/replay.py` scores each decision family (accuracy, Brier, calibration, risk-vs-coverage) without touching runtime behavior.
 - **No prompt-cache impact** — registration adds no model-visible system-prompt text; tools are ordinary registry entries.
 - **No TypeSafe/Jev dependency** — provider-neutral in spirit; this is one backend (Microsoft-Decision-1 on Azure), comparable against others via the replay harness.
 
